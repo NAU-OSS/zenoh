@@ -398,7 +398,13 @@ impl StageIn {
 
         let mut writer = self.fragbuf.writer();
         let codec = Zenoh080::new();
-        codec.write(&mut writer, msg).unwrap();
+        if let Err(e) = codec.write(&mut writer, msg) {
+            // The message cannot be serialized (e.g. a wire expression too long for its length
+            // prefix): restore the sequence number and drop the message
+            tch.sn.set(sn).unwrap();
+            tracing::warn!("Zenoh message dropped because it cannot be serialized: {e:?}");
+            return Ok(false);
+        }
 
         // Fragment the whole message
         let mut fragment = FragmentHeader {
@@ -1540,6 +1546,43 @@ mod tests {
             // Second message should be rejected
             assert!(producer.push_network_message(message.as_ref()).is_err());
         }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tx_pipeline_oversized_wire_expr() -> ZResult<()> {
+        // Pipeline
+        let tct = TransportPriorityTx::make(Bits::from(TransportSn::MAX))?;
+        let priorities = vec![tct];
+        let (producer, mut consumer) =
+            TransmissionPipeline::make(CONFIG_NOT_STREAMED, priorities.as_slice(), false);
+
+        // A wire expression that does not fit in the u16 length prefix cannot be encoded
+        let oversized = NetworkMessage::from(Push {
+            wire_expr: "a".repeat(usize::from(u16::MAX) + 1).into(),
+            ext_qos: ext::QoSType::new(Priority::Control, CongestionControl::Block, true),
+            ..Push::from(vec![42u8])
+        });
+        // Pushing it must not panic...
+        let _ = producer.push_network_message(oversized.as_ref());
+
+        // ...and the pipeline must still be usable afterwards, without a gap in the sequence numbers
+        let message = NetworkMessage::from(Push {
+            wire_expr: "test".into(),
+            ext_qos: ext::QoSType::new(Priority::Control, CongestionControl::Block, true),
+            ..Push::from(vec![42u8])
+        });
+        assert!(producer.push_network_message(message.as_ref())?);
+
+        let (batch, _) = timeout(TIMEOUT, consumer.pull()).await?.unwrap();
+        let mut reader = batch.as_slice().reader();
+        let msg: TransportMessage = Zenoh080::new().read(&mut reader).unwrap();
+        let TransportBody::Frame(Frame { sn, payload, .. }) = msg.body else {
+            panic!("expected a frame, got {:?}", msg.body);
+        };
+        assert_eq!(sn, 0);
+        assert_eq!(payload.len(), 1);
 
         Ok(())
     }
